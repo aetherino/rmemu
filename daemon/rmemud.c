@@ -1,7 +1,8 @@
 // rmemud: the emulated device's hardware hub, running inside the container.
 //
 //  - TCP :8888 for host clients (the rmemu server): sends the screen, takes input.
-//  - display.sock: xochitl's shim pushes screen rects here; relayed to every client.
+//  - display.sock: xochitl's shim pushes screen rects and panel updates here;
+//    relayed to every client.
 //  - input.sock: every process that opens a fake /dev/input/event* subscribes here
 //    and receives input_event streams; key/switch state is published in a shared
 //    file for EVIOCGKEY/EVIOCGSW.
@@ -302,20 +303,27 @@ static void on_readable(struct conn *c) {
         break;
     case C_DISPLAY:
     display_data:
-        // Relay complete 'F' rects and 'A' activity pings to every host client.
-        while (c->len - off >= 1 && c->buf[off] == 'A') {
+        // Relay complete messages to every host client: 'F' rects, 'W' panel
+        // updates, 'A' activity pings (see shim/fb.c).
+        for (;;) {
+            size_t avail = c->len - off, n = 0;
+            if (!avail) break;
+            if (c->buf[off] == 'A') n = 1;
+            else if (c->buf[off] == 'W') n = 13;
+            else if (c->buf[off] == 'F') {
+                if (avail < 13) break;
+                uint32_t zlen;
+                memcpy(&zlen, c->buf + off + 9, 4);
+                n = 13 + (size_t)zlen;
+            } else {
+                LOG("display sent unknown message 0x%02x", c->buf[off]);
+                drop(c);  // the shim reconnects and resends the screen
+                return;
+            }
+            if (avail < n) break;
             for (int i = 0; i < MAXC; i++)
-                if (conns[i].kind == C_HOST && send_all(conns[i].fd, "A", 1)) drop(&conns[i]);
-            off++;
-        }
-        while (c->len - off >= 13) {
-            if (c->buf[off] == 'A') { off++; continue; }
-            uint32_t zlen;
-            memcpy(&zlen, c->buf + off + 9, 4);
-            if (c->len - off < 13 + (size_t)zlen) break;
-            for (int i = 0; i < MAXC; i++)
-                if (conns[i].kind == C_HOST && send_all(conns[i].fd, c->buf + off, 13 + zlen)) drop(&conns[i]);
-            off += 13 + zlen;
+                if (conns[i].kind == C_HOST && send_all(conns[i].fd, c->buf + off, n)) drop(&conns[i]);
+            off += n;
         }
         break;
     }

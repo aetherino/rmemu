@@ -30,3 +30,7 @@ int input_dev_info(int i, const char **devnode, const char **name, const char **
 
 // fb.c
 void fb_init(void);
+// One region of a panel update and the class of waveform SWTCON drives it
+// with (from updates.c). Kinds match the 'W' message the simulator UI reads.
+enum { UPD_PEN = 1, UPD_ANIMATION, UPD_MONO, UPD_UI, UPD_CONTENT, UPD_FULL };
+void fb_update(int x, int y, int w, int h, int kind, unsigned flags);

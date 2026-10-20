@@ -1,5 +1,6 @@
 // Simulator UI: draws the device screen from the server's WebSocket and turns
 // pointer input into pen/touch records (same 16-byte format as shim/input.c).
+// Panel updates ('W') are played back the way the e-ink panel shows them.
 const W = 1620, H = 2160;
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
@@ -147,12 +148,16 @@ addEventListener('keydown', (e) => {
   if (t) setTool(t);
 });
 
-try {
-  setTool(localStorage.getItem('rmemu.tool') || 'pen');
-  setPaper(localStorage.getItem('rmemu.paper') === '1');
-} catch { setTool('pen'); }
-
 // ---------------------------------------------------------------- screen
+
+// `target` holds the device's pixels exactly (what screenshots show). The
+// visible canvas copies it rect by rect, except where an e-ink refresh is
+// playing: the shim announces each panel update ('W') before sending its
+// pixels, so the old image is still on screen to animate from.
+const target = document.createElement('canvas');
+target.width = W; target.height = H;
+const tctx = target.getContext('2d');
+const ghost = $('ghost'), gctx = ghost.getContext('2d');
 
 // Rects must be painted in arrival order; decompression is async.
 let chain = Promise.resolve();
@@ -162,10 +167,129 @@ function paint(buf) {
   const z = new Blob([new Uint8Array(buf, 13)]).stream().pipeThrough(new DecompressionStream('deflate'));
   chain = chain.then(async () => {
     const px = new Uint8ClampedArray(await new Response(z).arrayBuffer());
-    if (px.length === w * h * 4) ctx.putImageData(new ImageData(px, w, h), x, y);
+    if (px.length === w * h * 4) {
+      tctx.putImageData(new ImageData(px, w, h), x, y);
+      ctx.drawImage(target, x, y, w, h, x, y, w, h);  // refreshes in progress draw over this before the next paint
+    }
     updates++;
   }).catch(() => {});
 }
+
+// ---------------------------------------------------------------- e-ink refresh
+
+// Update kinds and their waveform's duration come from the shim (shim/common.h).
+const PEN = 1, ANIMATION = 2, FULL = 6;
+let eink = true;
+const waves = [];  // refreshes in progress, oldest first
+let raf = 0;
+
+const inside = (a, b) => a.x >= b.x && a.y >= b.y && a.x + a.w <= b.x + b.w && a.y + a.h <= b.y + b.h;
+const smooth = (t) => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t));
+function layer(w, h) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  return c;
+}
+
+function wave(buf) {
+  const v = new DataView(buf);
+  const r = { x: v.getUint16(1, true), y: v.getUint16(3, true), w: v.getUint16(5, true), h: v.getUint16(7, true),
+              kind: v.getUint8(9), ms: v.getUint16(11, true) };
+  chain = chain.then(() => startWave(r));
+}
+
+function startWave(r) {
+  // Pen strokes and animations use waveforms too fast to see.
+  if (!eink || !r.ms || r.kind === PEN || r.kind === ANIMATION) return;
+  // A flash already running here ends on the final pixels anyway.
+  if (waves.some((o) => o.kind === FULL && inside(r, o))) return;
+  // This one starts from whatever older refreshes inside it show right now.
+  for (let i = waves.length - 1; i >= 0; i--) if (inside(waves[i], r)) waves.splice(i, 1);
+  const old = layer(r.w, r.h);
+  old.getContext('2d').drawImage(canvas, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+  // A full refresh clears the panel's ghosting.
+  if (r.kind === FULL) gctx.clearRect(r.x, r.y, r.w, r.h);
+  waves.push({ ...r, old, mix: r.kind === FULL ? null : layer(r.w, r.h), start: performance.now() });
+  if (!raf) raf = requestAnimationFrame(frame);
+}
+
+// Full refresh: the old image inverts, the panel goes black, then white, and
+// the new image develops out of the white.
+function drawFlash(f, p) {
+  const { x, y, w, h } = f;
+  if (p < 0.15) {
+    ctx.drawImage(f.old, x, y);
+    ctx.globalCompositeOperation = 'difference';
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(x, y, w, h);
+    ctx.globalCompositeOperation = 'source-over';
+    return;
+  }
+  ctx.fillStyle = p < 0.38 ? '#000' : '#fff';
+  ctx.fillRect(x, y, w, h);
+  if (p < 0.55) return;
+  ctx.globalAlpha = smooth((p - 0.55) / 0.3);
+  ctx.drawImage(target, x, y, w, h, x, y, w, h);
+  ctx.globalAlpha = 1;
+}
+
+// Partial update: changed pixels fade over to the new image, dipping darker
+// on the way like the panel's particles do; unchanged pixels stay put.
+function drawPartial(u, p) {
+  const { x, y, w, h } = u;
+  ctx.drawImage(u.old, x, y);
+  ctx.globalAlpha = smooth(p);
+  ctx.drawImage(target, x, y, w, h, x, y, w, h);
+  const dip = 0.6 * Math.sin(Math.PI * p);
+  if (dip > 0.02) {
+    // mix = 1 - |old - new|: white where nothing changes.
+    const m = u.mix.getContext('2d');
+    m.globalCompositeOperation = 'copy';
+    m.drawImage(u.old, 0, 0);
+    m.globalCompositeOperation = 'difference';
+    m.drawImage(target, x, y, w, h, 0, 0, w, h);
+    m.fillStyle = '#fff';
+    m.fillRect(0, 0, w, h);
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.globalAlpha = dip;
+    ctx.drawImage(u.mix, x, y);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  ctx.globalAlpha = 1;
+}
+
+function frame(now) {
+  raf = 0;
+  for (const u of waves) {
+    const p = Math.min(1, (now - u.start) / u.ms);
+    if (p < 1) { (u.kind === FULL ? drawFlash : drawPartial)(u, p); continue; }
+    ctx.drawImage(target, u.x, u.y, u.w, u.h, u.x, u.y, u.w, u.h);
+    // Partial updates leave a faint trace of the old image behind.
+    if (u.kind !== FULL) gctx.drawImage(u.old, u.x, u.y);
+    u.done = true;
+  }
+  for (let i = waves.length - 1; i >= 0; i--) if (waves[i].done) waves.splice(i, 1);
+  if (waves.length) raf = requestAnimationFrame(frame);
+}
+
+function setEink(on) {
+  eink = on;
+  $('eink').setAttribute('aria-pressed', String(on));
+  ghost.hidden = !on;
+  if (!on) {
+    waves.length = 0;
+    ctx.drawImage(target, 0, 0);
+    gctx.clearRect(0, 0, W, H);
+  }
+  try { localStorage.setItem('rmemu.eink', on ? '1' : '0'); } catch {}
+}
+$('eink').addEventListener('click', () => setEink(!eink));
+
+try {
+  setTool(localStorage.getItem('rmemu.tool') || 'pen');
+  setPaper(localStorage.getItem('rmemu.paper') === '1');
+  setEink(localStorage.getItem('rmemu.eink') !== '0');
+} catch { setTool('pen'); setEink(true); }
 
 function status(s) {
   $('dot').classList.toggle('on', !!s.connected);
@@ -179,6 +303,7 @@ function connect() {
   ws.binaryType = 'arraybuffer';
   ws.onmessage = (m) => {
     if (typeof m.data === 'string') { const msg = JSON.parse(m.data); if (msg.type === 'status') status(msg); }
+    else if (new Uint8Array(m.data, 0, 1)[0] === 0x57) wave(m.data);
     else paint(m.data);
   };
   ws.onclose = () => { status({ connected: false }); setTimeout(connect, 1000); };

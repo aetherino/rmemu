@@ -49,7 +49,7 @@ bin/rmemu start <version>
 ## Simulator UI
 
 - **Pen / Eraser / Finger** (P / E / F): drive the digitizer or the touchscreen. Pressure and tilt come through if you use a real stylus. Hold ⌥ in Finger mode to pinch.
-- **Toolbar**: power, Folio cover, screenshot (⌘S), restart xochitl, and "paper tone" (an approximation of the e-ink look).
+- **Toolbar**: power, Folio cover, screenshot (⌘S), restart xochitl, "paper tone" (an approximation of the e-ink look), and "e-ink refresh" (on by default). With e-ink refresh on, full refreshes flash black and white, partial updates fade in over roughly half a second, and they leave a faint ghost of the old image until the next full refresh. Pen strokes stay instant. Screenshots always show the final image.
 - **Marker** beside the device: click it to attach the Marker (docks and charges it) or detach it.
 - **Status bar**: shows the cursor position in device pixels, ready to paste into `rmemu tap`.
 
@@ -92,13 +92,13 @@ The emulator behaves like a tablet in developer mode:
                                     └───────────────────────────────────────────────┘
 ```
 
-- **Display** ([shim/drm.c](shim/drm.c), [shim/fb.c](shim/fb.c)): xochitl drives the panel through SWTCON over atomic KMS. The shim provides that KMS device with the panel's real 405×1084 scanout mode, paces flips at 85 Hz, and streams the 1620×2160 image xochitl renders.
+- **Display** ([shim/drm.c](shim/drm.c), [shim/fb.c](shim/fb.c)): xochitl drives the panel through SWTCON over atomic KMS. The shim provides that KMS device with the panel's real 405×1084 scanout mode, paces flips at 85 Hz, and streams the 1620×2160 image xochitl renders. [shim/updates.c](shim/updates.c) reads SWTCON's `rm.framebuffer.updates` log, so the simulator gets each update's region and waveform class (pen, UI, content, full refresh) before its pixels.
 - **Input** ([shim/input.c](shim/input.c), [daemon/rmemud.c](daemon/rmemud.c)): fake evdev devices for the Elan pen and touchscreen, the power key and the hall sensors, fanned out to every reader. Fake udev and `sd_device` support lets Qt find the devices and carries charger and Marker-docking events.
 - **The rest** ([shim/](shim/), [docker/root/](docker/root/)): a software PKCS#11 token in place of OP-TEE, the orientation sensor, a sysfs tree (battery, charger, temperature, display info, secure boot reported as unlocked), and faked realtime thread priority.
 
 **Not emulated yet:**
 
-- E-ink refresh visuals (no flash or ghosting)
+- Exact e-ink rendering: refreshes are stylized and timed with nominal waveform durations, and colors are only approximated
 - Wi-Fi and cloud sync
 - Auto-rotation
 - Type Folio keyboard and Bluetooth

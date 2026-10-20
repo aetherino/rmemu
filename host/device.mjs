@@ -1,5 +1,6 @@
 // Connection to the shim's frame/input socket inside the container.
-// Keeps a full RGBA copy of the screen and re-emits each dirty rect.
+// Keeps a full RGBA copy of the screen and re-emits each dirty rect, plus the
+// panel updates ('W') that say how the e-ink panel refreshes them.
 import net from 'node:net';
 import zlib from 'node:zlib';
 import { EventEmitter } from 'node:events';
@@ -40,10 +41,11 @@ export class Device extends EventEmitter {
         this.sock = sock;
         this.emit('status');
       }
-      // 'F' u16 x y w h, u32 zlen, zlib(RGBA) | 'A' (panel busy)
+      // 'F' u16 x y w h, u32 zlen, zlib(RGBA) | 'W' u16 x y w h, u8 kind flags, u16 ms | 'A' (panel busy)
       for (;;) {
         if (buf.length >= 1 && buf[0] === 0x41) { buf = buf.subarray(1); this.lastActivityAt = Date.now(); continue; }
         if (buf.length < 13) break;
+        if (buf[0] === 0x57) { this.applyWave(buf.subarray(0, 13)); buf = buf.subarray(13); continue; }
         const zlen = buf.readUInt32LE(9);
         if (buf.length < 13 + zlen) break;
         const msg = buf.subarray(0, 13 + zlen);
@@ -69,6 +71,14 @@ export class Device extends EventEmitter {
     this.lastFrameAt = Date.now();
     this.frames++;
     this.emit('rect', Buffer.from(msg), { x, y, w, h });
+  }
+
+  applyWave(msg) {
+    this.lastActivityAt = Date.now();
+    this.emit('wave', Buffer.from(msg), {
+      x: msg.readUInt16LE(1), y: msg.readUInt16LE(3), w: msg.readUInt16LE(5), h: msg.readUInt16LE(7),
+      kind: msg[9], flags: msg[10], ms: msg.readUInt16LE(11),
+    });
   }
 
   // Whole screen as one 'F' message, for clients that join late.

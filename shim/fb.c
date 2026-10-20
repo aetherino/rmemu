@@ -4,10 +4,21 @@
 // Display socket protocol (little-endian), shim -> rmemud:
 //   hello: "RMFB" u16 width u16 height
 //   rect:  'F' u16 x u16 y u16 w u16 h u32 zlen, zlib(RGBA rows)
+//   wave:  'W' u16 x u16 y u16 w u16 h u8 kind u8 flags u16 ms
+//          A panel update starts in this region: kind is UPD_* (common.h),
+//          flags SWTCON's update flags, ms how long its waveform drives the
+//          panel. Sent before the region's 'F' rects, so a viewer still has the
+//          old image to animate from.
 //   activity: 'A'  (the panel is being driven; sent at most every 100ms)
 // rmemud -> shim: 'R' = resend the whole screen (a new viewer joined).
+//
+// Once updates.c reports xochitl's panel updates, rects go out when xochitl
+// hands a region to the panel (like the real screen, nothing shows before
+// that), with a slow sweep as a safety net. Until then, or for other apps that
+// render into a screen-sized QImage, the screen is polled.
 #include "common.h"
 #include "devices.h"
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -26,6 +37,19 @@ static const uint32_t *screen;  // xochitl's RGB32 framebuffer (0xffRRGGBB)
 static long screen_bpl;
 static uint32_t *shadow;        // what rmemud last got
 static volatile int poke;       // set on display activity; makes the scanner look now
+
+// How long each kind of update drives the panel: the main pass of SWTCON's
+// phase frames for UI, content and full refreshes, measured at the fake
+// sensor's 23 °C. Mono is a guess (a DU-style waveform); pen strokes and
+// animations use fast waveforms that read as instant.
+static const uint16_t wave_ms[] = { [UPD_MONO] = 250, [UPD_UI] = 500, [UPD_CONTENT] = 600, [UPD_FULL] = 700 };
+
+struct update { int x, y, w, h, kind; unsigned flags; };
+static struct update queue[64];
+static int queued, overflow;
+static volatile int follows_updates;  // updates.c has reported at least one
+static pthread_mutex_t qlock = PTHREAD_MUTEX_INITIALIZER;
+static int wake[2] = { -1, -1 };      // fb_update() -> scanner
 
 static int send_all(int fd, const void *buf, size_t n) {
     const char *p = buf;
@@ -64,6 +88,31 @@ static int send_rect(int fd, int x, int y, int w, int h) {
     return rc;
 }
 
+static int send_wave(int fd, const struct update *u) {
+    unsigned char m[13] = { 'W' };
+    uint16_t v[4] = { (uint16_t)u->x, (uint16_t)u->y, (uint16_t)u->w, (uint16_t)u->h };
+    memcpy(m + 1, v, 8);
+    m[9] = (unsigned char)u->kind;
+    m[10] = (unsigned char)u->flags;
+    uint16_t ms = u->kind < (int)(sizeof wave_ms / sizeof *wave_ms) ? wave_ms[u->kind] : wave_ms[UPD_UI];
+    memcpy(m + 11, &ms, 2);
+    return send_all(fd, m, sizeof m);
+}
+
+void fb_update(int x, int y, int w, int h, int kind, unsigned flags) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > W) w = W - x;
+    if (y + h > H) h = H - y;
+    if (w <= 0 || h <= 0) return;
+    pthread_mutex_lock(&qlock);
+    if (queued < (int)(sizeof queue / sizeof *queue)) queue[queued++] = (struct update){ x, y, w, h, kind, flags };
+    else overflow = 1;
+    follows_updates = 1;
+    pthread_mutex_unlock(&qlock);
+    if (wake[1] >= 0 && write(wake[1], "", 1) < 0) { /* already awake */ }
+}
+
 static int tile_dirty(int tx, int ty) {
     for (int r = 0; r < TILE; r++) {
         int y = ty * TILE + r;
@@ -73,15 +122,44 @@ static int tile_dirty(int tx, int ty) {
     return 0;
 }
 
-// Send each horizontal band of dirty tiles as one rect spanning its dirty columns.
-static int scan(int fd) {
-    for (int ty = 0; ty < H / TILE; ty++) {
-        int x0 = -1, x1 = -1;
-        for (int tx = 0; tx < W / TILE; tx++)
-            if (tile_dirty(tx, ty)) { if (x0 < 0) x0 = tx; x1 = tx; }
-        if (x0 >= 0 && send_rect(fd, x0 * TILE, ty * TILE, (x1 - x0 + 1) * TILE, TILE)) return -1;
+// Within pixel bounds [x0,x1) x [y0,y1), send each horizontal band of dirty
+// tiles as one rect spanning its dirty columns. Returns how many went out (-1
+// on error); a dry run just reports whether anything is dirty.
+static int scan(int fd, int x0, int y0, int x1, int y1, int dry) {
+    int n = 0;
+    for (int ty = y0 / TILE; ty < (y1 + TILE - 1) / TILE; ty++) {
+        int c0 = -1, c1 = -1;
+        for (int tx = x0 / TILE; tx < (x1 + TILE - 1) / TILE; tx++)
+            if (tile_dirty(tx, ty)) { if (dry) return 1; if (c0 < 0) c0 = tx; c1 = tx; }
+        if (c0 < 0) continue;
+        if (send_rect(fd, c0 * TILE, ty * TILE, (c1 - c0 + 1) * TILE, TILE)) return -1;
+        n++;
     }
-    return 0;
+    return n;
+}
+
+// Announce queued panel updates, then send their pixels.
+static int send_updates(int fd, int *pen_only) {
+    struct update u[64];
+    pthread_mutex_lock(&qlock);
+    int n = queued, all = overflow;
+    memcpy(u, queue, sizeof *u * n);
+    queued = overflow = 0;
+    pthread_mutex_unlock(&qlock);
+    int x0 = W, y0 = H, x1 = 0, y1 = 0;
+    *pen_only = !all;
+    for (int i = 0; i < n; i++) {
+        if (u[i].kind != UPD_PEN) {
+            *pen_only = 0;
+            if (send_wave(fd, &u[i])) return -1;
+        }
+        if (u[i].x < x0) x0 = u[i].x;
+        if (u[i].y < y0) y0 = u[i].y;
+        if (u[i].x + u[i].w > x1) x1 = u[i].x + u[i].w;
+        if (u[i].y + u[i].h > y1) y1 = u[i].y + u[i].h;
+    }
+    if (all) return scan(fd, 0, 0, W, H, 0);
+    return x0 < x1 ? scan(fd, x0, y0, x1, y1, 0) : 0;
 }
 
 static int connect_display(void) {
@@ -100,16 +178,19 @@ extern uint64_t drm_commits;
 
 static void *scanner(void *arg) {
     (void)arg;
-    int fd = -1, idle = 0, quiet_ticks = 0;
+    int fd = -1, idle = 0, quiet_ticks = 0, stale = 0;
     uint64_t seen = 0;
     for (;;) {
         if (fd < 0 && (fd = connect_display()) < 0) { sleep(1); continue; }
-        // Poll ~60Hz right after display activity, ~4Hz otherwise; wake early on 'R'.
-        struct pollfd p = { fd, POLLIN, 0 };
-        if (poll(&p, 1, 16) > 0) {
-            char c;
-            if (recv(fd, &c, 1, 0) <= 0) { close(fd); fd = -1; continue; }
-            if (c == 'R' && send_rect(fd, 0, 0, W, H)) { close(fd); fd = -1; continue; }
+        // Tick at ~60Hz; wake early on 'R' or a panel update.
+        struct pollfd p[2] = { { fd, POLLIN, 0 }, { wake[0], POLLIN, 0 } };
+        if (poll(p, 2, 16) > 0) {
+            char c[64];
+            if (p[1].revents & POLLIN) while (read(wake[0], c, sizeof c) > 0) ;
+            if (p[0].revents & (POLLIN | POLLHUP)) {
+                if (recv(fd, c, 1, 0) <= 0) { close(fd); fd = -1; continue; }
+                if (c[0] == 'R' && send_rect(fd, 0, 0, W, H)) { close(fd); fd = -1; continue; }
+            }
         }
         if (poke) { poke = 0; idle = 0; }
         // Waveforms keep running after the image changes; tell the host so
@@ -118,8 +199,26 @@ static void *scanner(void *arg) {
             seen = drm_commits; quiet_ticks = 0;
             if (send_all(fd, "A", 1)) { close(fd); fd = -1; continue; }
         }
-        if (idle++ > 30 && idle % 15) continue;
-        if (scan(fd)) { close(fd); fd = -1; }
+        if (follows_updates) {
+            int pen_only;
+            if (__atomic_load_n(&queued, __ATOMIC_RELAXED) || __atomic_load_n(&overflow, __ATOMIC_RELAXED)) {
+                idle = stale = 0;
+                if (send_updates(fd, &pen_only) < 0) { close(fd); fd = -1; continue; }
+                // Pen strokes come as hundreds of tiny updates a second; batch them.
+                if (pen_only) usleep(6000);
+                continue;
+            }
+            // Safety net for pixels that reach the screen unannounced: send them
+            // once they've sat through a whole sweep (xochitl paints right
+            // before it swaps, so anything announced is gone by then).
+            if (++idle % 15) continue;
+            if (!stale) { stale = scan(fd, 0, 0, W, H, 1) > 0; continue; }
+            stale = 0;
+        } else {
+            // Poll ~60Hz right after display activity, ~4Hz otherwise.
+            if (idle++ > 30 && idle % 15) continue;
+        }
+        if (scan(fd, 0, 0, W, H, 0) < 0) { close(fd); fd = -1; }
     }
     return NULL;
 }
@@ -132,6 +231,7 @@ static void found_screen(const void *data, long bpl) {
     TRACE("fb: captured screen buffer %p (bpl %ld)", data, bpl);
     static int started;
     if (started++) return;
+    if (pipe2(wake, O_CLOEXEC | O_NONBLOCK)) LOG("fb: no wake pipe, polling only");
     drm_on_flip = on_flip;
     pthread_t th;
     pthread_create(&th, NULL, scanner, NULL);

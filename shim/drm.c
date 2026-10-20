@@ -2,7 +2,14 @@
 // panel. SWTCON (xochitl's software timing controller) talks atomic KMS to it
 // and scans out waveform phase frames; we accept those, pace page-flip events
 // at the panel refresh rate, and otherwise ignore the phase data — the real
-// pixels are captured upstream in fb.c.
+// pixels are captured upstream in fb.c, and which updates run is reported by
+// updates.c.
+//
+// Phase frame format, as observed: each 32-bit word holds eight 3-bit drive
+// phases in its low 24 bits (0 = not driven, so an idle panel scans out all
+// zeros). The first 4 of the 1084 rows are dummy lines; after those, scanout
+// row r carries panel rows 2(r-4) and 2(r-4)+1, and scanout column c falls on
+// panel x = c/2. SWTCON only commits while some pixel is being driven.
 #include "common.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -122,13 +129,23 @@ static void ts_add(struct timespec *t, long ns) {
     while (t->tv_nsec >= 1000000000L) { t->tv_nsec -= 1000000000L; t->tv_sec++; }
 }
 
+static int64_t ts_ns(const struct timespec *t) { return (int64_t)t->tv_sec * 1000000000 + t->tv_nsec; }
+
 // Block until the next simulated vblank, then queue a flip-complete event.
+// Vblanks stay on a fixed 85 Hz grid: a commit that arrives after an idle
+// spell waits for the next one instead of flipping right away (otherwise a
+// waveform that starts after a pause would play back far too fast).
 static void vblank(uint64_t user_data, int want_event) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     long period = (long)(1e9 / refresh_hz);
-    if (now.tv_sec > next_vsync.tv_sec + 1) next_vsync = now;
     ts_add(&next_vsync, period);
+    int64_t behind = ts_ns(&now) - ts_ns(&next_vsync);
+    if (behind > 0) {
+        int64_t t = ts_ns(&next_vsync) + (behind / period + 1) * period;
+        next_vsync.tv_sec = t / 1000000000;
+        next_vsync.tv_nsec = t % 1000000000;
+    }
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_vsync, NULL);
     if (drm_on_flip) drm_on_flip();
     if (!want_event) return;
@@ -141,44 +158,6 @@ static void vblank(uint64_t user_data, int want_event) {
     ev.sequence = (uint32_t)commits;
     ev.crtc_id = CRTC;
     if (write(wr, &ev, sizeof ev) != sizeof ev) LOG("drm event write failed");
-}
-
-
-// PROBE (temporary): analyze each scanned-out phase frame.
-static void probe_frame(uint32_t fb_id) {
-    static int on = -1;
-    if (on < 0) on = getenv("RMEMU_PROBE") != NULL;
-    if (!on || fb_id < 100 || fb_id - 100 >= nfbs) return;
-    struct fb *f = &fbs[fb_id - 100];
-    if (f->handle < 1 || f->handle > (uint32_t)ndumbs) return;
-    struct dumb *d = &dumbs[f->handle - 1];
-    const uint32_t *px = mmap(NULL, d->size, PROT_READ, MAP_SHARED, mem, d->off);
-    if (px == MAP_FAILED) return;
-    uint32_t x0 = 9999, y0 = 9999, x1 = 0, y1 = 0, hi = 0;
-    uint32_t hist[8] = {0};
-    for (uint32_t y = 0; y < f->h; y++) {
-        const uint32_t *row = (const uint32_t *)((const char *)px + (size_t)y * f->pitch);
-        for (uint32_t x = 0; x < f->w; x++) {
-            uint32_t v = row[x];
-            if (v >> 24) hi++;
-            for (int b = 0; b < 8; b++) {
-                uint32_t ph = (v >> (b * 3)) & 7;
-                hist[ph]++;
-                if (ph) { uint32_t X = x * 8 + b; if (X < x0) x0 = X; if (X > x1) x1 = X; if (y < y0) y0 = y; if (y > y1) y1 = y; }
-            }
-        }
-    }
-    munmap((void *)px, d->size);
-    static char last[256]; static int reps; static uint64_t first;
-    char cur[256];
-    snprintf(cur, sizeof cur, "bbox=%u,%u-%u,%u hi=%u h=%u %u %u %u %u %u %u %u", x0, y0, x1, y1, hi, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7]);
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    if (strcmp(cur, last)) {
-        if (reps) LOG("probe   x%d", reps);
-        LOG("probe #%llu t=%ld.%03ld %s", (unsigned long long)commits, (long)ts.tv_sec, ts.tv_nsec / 1000000, cur);
-        strcpy(last, cur); reps = 0; first = commits;
-    } else reps++;
-    (void)first;
 }
 
 static int atomic(struct drm_mode_atomic *a) {
@@ -210,7 +189,6 @@ static int atomic(struct drm_mode_atomic *a) {
         }
     }
     commits++;
-    probe_frame(cur_fb);
     if (commits == 1 || !(commits % 5000)) TRACE("drm atomic commit #%llu flags=0x%x", (unsigned long long)commits, a->flags);
     vblank(a->user_data, a->flags & DRM_MODE_PAGE_FLIP_EVENT);
     return 0;

@@ -2,7 +2,7 @@
 // (WebSocket) and to scripts/agents (HTTP API).
 //
 //   GET  /                     simulator UI
-//   GET  /ws                   live screen (binary 'F' rects) + input (16-byte records)
+//   GET  /ws                   live screen (binary 'F' rects, 'W' panel updates) + input (16-byte records)
 //   GET  /api/status           connection + device info
 //   GET  /api/screenshot.png   ?scale=0.5
 //   POST /api/gesture          {op: tap|longpress|swipe|draw|pinch|key|folio, ...}; waits for the screen to settle
@@ -96,6 +96,7 @@ async function handleCommand(sock, text) {
 }
 
 device.on('rect', (msg) => { for (const c of clients) wsSend(c, msg); });
+device.on('wave', (msg) => { for (const c of clients) wsSend(c, msg); });
 device.on('status', () => info().then((i) => { for (const c of clients) wsSend(c, JSON.stringify({ type: 'status', ...i })); }));
 
 // ---------------------------------------------------------------- http

@@ -48,6 +48,10 @@
         <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 3h7l3 3v11H5z"/><path d="M12 3v3h3"/></svg>
         <span class="sr">Paper tone</span>
       </button>
+      <button id="eink" aria-pressed="true" title="E-ink refresh: play refresh flashes, partial updates and faint ghosting like the panel">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="4" y="3" width="12" height="14" rx="1.5"/><path d="M10 3H5.5A1.5 1.5 0 004 4.5v11A1.5 1.5 0 005.5 17H10z" fill="currentColor"/></svg>
+        <span class="sr">E-ink refresh</span>
+      </button>
     </div>
   </header>
 
@@ -56,6 +60,7 @@
       <button class="power-key" id="powerKey" aria-label="Power button"></button>
       <div class="screen" id="screen">
         <canvas id="canvas" width="1620" height="2160" aria-label="Device screen"></canvas>
+        <canvas id="ghost" class="ghost" width="1620" height="2160" aria-hidden="true"></canvas>
         <div class="touches" id="touches" aria-hidden="true"></div>
         <div class="offline" id="offline">
           <p>Waiting for the device…</p>
