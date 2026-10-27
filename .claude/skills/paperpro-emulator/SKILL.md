@@ -5,7 +5,7 @@ description: Drive the reMarkable Paper Pro emulator in this repo — boot it, l
 
 # Paper Pro emulator harness
 
-The emulator runs the **stock reMarkable Paper Pro firmware** (xochitl, Qt 6.8, firmware 3.27.1.0 by default) natively in an arm64 Docker container, with a preload shim faking the hardware. Everything is driven through `bin/rmemu` from the repo root. The user may be watching the same device live in the simulator UI at http://127.0.0.1:7777, so act deliberately.
+The emulator runs the **stock reMarkable Paper Pro firmware** (xochitl; 3.27.1.0 with Qt 6.8 from the firmware index, 3.29.0.153 with Qt 6.10 imported from a tablet with `tools/import-tablet.sh`; `bin/rmemu start` runs the newest image) natively in an arm64 Docker container, with a preload shim faking the hardware. Everything is driven through `bin/rmemu` from the repo root. The user may be watching the same device live in the simulator UI at http://127.0.0.1:7777, so act deliberately.
 
 ## 1. Get to a known state
 
@@ -70,7 +70,7 @@ bin/rmemu logs [-f]             # xochitl + shim + rmemud output
 - `systemctl` only knows `xochitl`, `marker-manager`, `rmemud` (start/stop/restart/status).
 - Testing on other firmware: `bin/rmemu versions`, `bin/rmemu start <version>`.
 
-## 5. UI map (firmware 3.27.1.0 — verify with a screenshot)
+## 5. UI map (firmware 3.27.1.0 and 3.29.0.153 — verify with a screenshot)
 
 | Where | Target | Device coords |
 |---|---|---|
@@ -91,7 +91,7 @@ The open-notebook toolbar sits on the left edge at x ≈ 56 (y ≈ 168 pen, 280 
 - Screen frozen / black → `bin/rmemu restart`.
 - UI server down (CLI says "emulator is not running" but container runs) → `bin/rmemu start` restarts just the server.
 - Emulating new hardware or fixing the shim: `bin/rmemu restart --debug` then `bin/rmemu logs` shows every hardware path/ioctl xochitl touches (`FAIL` lines are what's missing). Read `CLAUDE.md` and `README.md` ("How it works") before changing `shim/`, `daemon/` or `docker/`; rebuild with
-  `docker build -q -t rmemu:3.27.1.0 -f docker/Dockerfile . && bin/rmemu stop && docker rm -f rmemu && bin/rmemu start`.
+  `docker build -q --build-arg ROOTFS=rmpp-rootfs:<version> -t rmemu:<version> -f docker/Dockerfile . && bin/rmemu stop && docker rm -f rmemu && bin/rmemu start`.
 
 ## Not emulated
 

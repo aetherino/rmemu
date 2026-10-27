@@ -28,7 +28,9 @@ const docker = (args) => new Promise((resolve) => {
   execFile('docker', args, { maxBuffer: 16 << 20 }, (err, stdout, stderr) => resolve({ ok: !err, out: stdout + stderr }));
 });
 
+// Read once per connection: `rmemu start <version>` swaps the container under us.
 let firmware = null;
+device.on('status', () => { if (!device.connected) firmware = null; });
 async function info() {
   if (!firmware) {
     const r = await docker(['exec', CONTAINER, 'sh', '-c', '. /etc/os-release; echo $IMG_VERSION']);

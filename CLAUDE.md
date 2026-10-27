@@ -14,7 +14,7 @@ Full guide: the `paperpro-emulator` skill (`.claude/skills/paperpro-emulator/SKI
 
 ## Changing the emulator
 
-- C code in `shim/` (LD_PRELOAD library + `shim/pkcs11/` soft token) and `daemon/rmemud.c` is compiled inside the Docker build (Ubuntu 24.04 arm64, glibc matches the rootfs). Rebuild + reboot: `docker build -q -t rmemu:3.27.1.0 -f docker/Dockerfile . && bin/rmemu stop && docker rm -f rmemu && bin/rmemu start`.
+- C code in `shim/` (LD_PRELOAD library + `shim/pkcs11/` soft token) and `daemon/rmemud.c` is compiled inside the Docker build (Ubuntu 24.04 arm64, glibc matches the rootfs). Rebuild + reboot: `docker build -q --build-arg ROOTFS=rmpp-rootfs:<version> -t rmemu:<version> -f docker/Dockerfile . && bin/rmemu stop && docker rm -f rmemu && bin/rmemu start`.
 - Host side (`host/`, `bin/rmemu`) is dependency-free Node; restart the server with `pkill -f host/server.mjs; bin/rmemu start`.
 - New hardware xochitl wants usually shows up as `FAIL` lines under `bin/rmemu restart --debug` + `bin/rmemu logs`; fake sysfs files go in `docker/root/sys/...` (device-tree values are big-endian binary).
 - `firmware/` (downloaded) and `.rmemu/` (SSH key, server log) are gitignored.

@@ -19,7 +19,14 @@ COPY docker/bin/ /usr/local/bin/
 # Every process (including SSH sessions, which get a fresh environment) sees
 # the fake hardware, like a shell on the real device. Blank root password for
 # the container-only SSH server.
+# Without systemd, D-Bus can't start timedated or localed (their activation files say
+# Exec=/bin/false and leave it to systemd), so let it run them itself. From 3.29 xochitl
+# aborts when timedate1 doesn't answer.
 RUN echo /opt/rmemu/rmemu-shim.so > /etc/ld.so.preload && \
-    sed -i 's/^root:[^:]*:/root::/' /etc/shadow
+    sed -i 's/^root:[^:]*:/root::/' /etc/shadow && \
+    for d in timedate locale; do \
+        sed -i -e "s|^Exec=/bin/false|Exec=/usr/lib/systemd/systemd-${d}d|" -e '/^SystemdService=/d' \
+            /usr/share/dbus-1/system-services/org.freedesktop.${d}1.service; \
+    done
 EXPOSE 22 8888
 ENTRYPOINT ["/bin/sh", "/opt/rmemu/entrypoint.sh"]

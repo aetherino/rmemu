@@ -24,7 +24,7 @@ Device data persists in the `rmemu-home` and `rmemu-data` Docker volumes. `bin/r
 
 ## Getting the firmware
 
-The emulator needs a Paper Pro firmware update package, a `.swu` file named like `remarkable-production-image-3.27.1.0-ferrari-public.swu`. Use the version your tablet runs (Settings → General → Software). There are two ways to get it:
+The emulator needs a Paper Pro firmware update package, a `.swu` file named like `remarkable-production-image-3.27.1.0-ferrari-public.swu`. Use the version your tablet runs (Settings → General → Software). There are three ways to get it:
 
 **1. Let rmemu fetch it (easiest).**
 
@@ -45,6 +45,18 @@ bin/rmemu start <version>
 ```
 
 `import-rootfs.sh` unpacks the `.swu` (a cpio archive containing an ext4 image) with `debugfs` in a throwaway container. It needs no root access or privileged mode. Firmware files are gitignored. Don't commit or redistribute them.
+
+**3. Copy it from your own tablet.** For a version the index doesn't have yet (3.29.0.153, for one), with the tablet in developer mode on USB:
+
+```bash
+tools/import-tablet.sh root@10.11.99.1     # prints rmpp-rootfs:<version>
+docker build --build-arg ROOTFS=rmpp-rootfs:<version> -t rmemu:<version> -f docker/Dockerfile .
+bin/rmemu start <version>
+```
+
+It streams the tablet's read-only root filesystem over SSH, leaving out any file changed after the firmware was built (units you installed in developer mode, say), so the image is stock.
+
+Tested: 3.27.1.0 (from the index) and 3.29.0.153 (from a tablet). On 3.29 xochitl aborts unless `org.freedesktop.timedate1` answers on D-Bus, so the image lets D-Bus start `systemd-timedated` (and `systemd-localed`) itself.
 
 ## Simulator UI
 
